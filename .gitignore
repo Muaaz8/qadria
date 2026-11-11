@@ -1,0 +1,12 @@
+# Generated data / customer documents
+invoices/
+cache/
+exports/
+*.txt
+
+# Old copies of system.php (one contains production DB credentials)
+system___*.php
+system____*.php
+
+# Contains production DB credentials
+upload_tool.php
