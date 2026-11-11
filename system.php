@@ -961,7 +961,59 @@ function saveInvoiceHTMLDirect($bill, $items, $year, $consignee, $clearing_agent
     return $full_path;
 }
 
+// Active headings for a bill type, from Masters > Bill Headings
 function getBillTypeHeadings($bill_type) {
+    global $pdo;
+    return array_column(getBillHeadingRows($pdo, $bill_type), 'heading');
+}
+
+function getBillHeadingRows($pdo, $bill_type = null, $activeOnly = true) {
+    $sql = "SELECT id, heading, bill_type, receipt_status, sort_order, is_active FROM custom_bill_headings WHERE 1=1";
+    $params = [];
+    if ($bill_type) {
+        $sql .= " AND bill_type = ?";
+        $params[] = $bill_type;
+    }
+    if ($activeOnly) {
+        $sql .= " AND is_active = 1";
+    }
+    $sql .= " ORDER BY bill_type, sort_order, heading";
+    $stmt = $pdo->prepare($sql);
+    $stmt->execute($params);
+    return $stmt->fetchAll(PDO::FETCH_ASSOC);
+}
+
+// One-time import of the old hardcoded headings into custom_bill_headings.
+// Headings the create-bill page used to load by default stay active; the rest are imported inactive.
+function seedBillHeadings($pdo) {
+    $active = [
+        'forwarding' => [
+            'Transportation Expense', 'Wharfage Expense', 'Excise Duty Expense', 'Delivery Order Expense',
+            'Lift Off / Lift On Expense', 'TP-Delivery Expense', 'Service Charges', 'Misc. Expense',
+            'Unloading Dry Port Expense', 'Token', 'Via Port', 'Trakker Payment', 'Container Placement Expense',
+            'Gate Pass Charges', 'Scanning Expense', 'Shipping Guarantee Charges'
+        ],
+        'detention' => [
+            'Container Rent Expense', 'Container Placement Expense', 'Empty Back Date Expense',
+            'Container Washing / Cleaning Expense'
+        ]
+    ];
+    $stmt = $pdo->prepare("INSERT IGNORE INTO custom_bill_headings (heading, bill_type, receipt_status, sort_order, is_active) VALUES (?, ?, 'Receipted', ?, ?)");
+    foreach (getLegacyBillTypeHeadings() as $bill_type => $legacy) {
+        $sort = 1;
+        $seen = [];
+        foreach ([[$active[$bill_type], 1], [$legacy, 0]] as [$list, $isActive]) {
+            foreach ($list as $heading) {
+                $key = strtolower(trim($heading));
+                if (isset($seen[$key])) continue;
+                $seen[$key] = true;
+                $stmt->execute([trim($heading), $bill_type, $sort++, $isActive]);
+            }
+        }
+    }
+}
+
+function getLegacyBillTypeHeadings() {
     $forwarding_headings = [
         "Examination Joint", "TP Charges + Delivery", "Urgent D/O Expenses", "Empty Transportation",
         "M. A Land TP Charges", "M. A Land Delivery Expanse", "License Fee (25,000 * 2)",
@@ -1001,9 +1053,7 @@ function getBillTypeHeadings($bill_type) {
         "Container Repairing Expense", "Container Empty Shifting Expense", "Handling / Administrative Fee", "DV Cost"
     ];
     
-    if ($bill_type == 'forwarding') return $forwarding_headings;
-    elseif ($bill_type == 'detention') return $detention_headings;
-    return [];
+    return ['forwarding' => $forwarding_headings, 'detention' => $detention_headings];
 }
 
 function generateBillNumber($pdo, $job_number, $year) {
@@ -1442,7 +1492,33 @@ try {
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         UNIQUE KEY unique_user_heading (bill_type, heading, user_id)
     )");
-    
+
+    // Bill headings master (managed from Masters > Bill Headings)
+    $pdo->exec("CREATE TABLE IF NOT EXISTS custom_bill_headings (
+        id INT PRIMARY KEY AUTO_INCREMENT,
+        heading VARCHAR(255) NOT NULL,
+        bill_type ENUM('forwarding','detention') NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )");
+    $stmt = $pdo->query("SHOW COLUMNS FROM custom_bill_headings");
+    $billHeadingColumns = $stmt->fetchAll(PDO::FETCH_COLUMN);
+    if (!in_array('receipt_status', $billHeadingColumns)) {
+        $pdo->exec("ALTER TABLE custom_bill_headings ADD COLUMN receipt_status VARCHAR(50) NOT NULL DEFAULT 'Receipted' AFTER bill_type");
+    }
+    if (!in_array('sort_order', $billHeadingColumns)) {
+        $pdo->exec("ALTER TABLE custom_bill_headings ADD COLUMN sort_order INT NOT NULL DEFAULT 0 AFTER receipt_status");
+    }
+    if (!in_array('is_active', $billHeadingColumns)) {
+        $pdo->exec("ALTER TABLE custom_bill_headings ADD COLUMN is_active TINYINT(1) NOT NULL DEFAULT 1 AFTER sort_order");
+    }
+    $stmt = $pdo->query("SHOW INDEX FROM custom_bill_headings WHERE Key_name = 'unique_bill_heading'");
+    if ($stmt->rowCount() == 0) {
+        $pdo->exec("ALTER TABLE custom_bill_headings ADD UNIQUE KEY unique_bill_heading (bill_type, heading)");
+    }
+    if ((int)$pdo->query("SELECT COUNT(*) FROM custom_bill_headings")->fetchColumn() === 0) {
+        seedBillHeadings($pdo);
+    }
+
     $pdo->exec("CREATE TABLE IF NOT EXISTS user_job_permissions (
         id INT PRIMARY KEY AUTO_INCREMENT,
         user_id INT NOT NULL,
@@ -4278,7 +4354,7 @@ if ($page == 'get-last-job-bill-items') {
 // =============================================
 
 if ($page == 'create-bill') {
-    $job_id = isset($_GET['job_id']) ? $_GET['job_id'] : 0;
+    $job_id = isset($_GET['job_id']) ? (int)$_GET['job_id'] : 0;
     $userId = getUserId();
     
     if (!canUserViewJob($pdo, $userId, $job_id)) {
@@ -4317,9 +4393,10 @@ if ($page == 'create-bill') {
         exit(); 
     }
     $savedHeadings = getSavedHeadings($pdo);
-    // var_dump($savedHeadings);
-    $forwardingCombinedHeadings = getCombinedHeadings($pdo, 'forwarding', $userId);
-    $detentionCombinedHeadings = getCombinedHeadings($pdo, 'detention', $userId);
+    $billHeadingDefs = ['forwarding' => [], 'detention' => []];
+    foreach (getBillHeadingRows($pdo) as $row) {
+        $billHeadingDefs[$row['bill_type']][] = ['heading' => $row['heading'], 'receipt_status' => $row['receipt_status']];
+    }
 }
 
 if ($page == 'save-bill' && $_SERVER['REQUEST_METHOD'] == 'POST') {
@@ -5666,6 +5743,9 @@ if ($page == 'masters') {
     
     $type = isset($_GET['type']) ? $_GET['type'] : 'bonded_carrier';
     $masters = getMasters($pdo, $type);
+    if ($type == 'bill_heading') {
+        $billHeadingRows = getBillHeadingRows($pdo, null, false);
+    }
     $types = [
         'bonded_carrier'=>'Bonded Carrier Name',
         'do_collected_date'=>'D/O', // Changed from 'do' to 'do_collected_date'
@@ -5680,6 +5760,63 @@ if ($page == 'masters') {
         'depositor'=>'Depositor',
         'description'=>'Description'
     ];
+}
+
+if ($page == 'save-bill-heading' && $_SERVER['REQUEST_METHOD'] == 'POST' && isAdmin()) {
+    header('Content-Type: application/json');
+    $data = json_decode(file_get_contents('php://input'), true) ?: [];
+    $id = (int)($data['id'] ?? 0);
+    $heading = trim($data['heading'] ?? '');
+    $bill_type = $data['bill_type'] ?? '';
+    $receipt_status = $data['receipt_status'] ?? '';
+    $is_active = !empty($data['is_active']) ? 1 : 0;
+    $sort_order = trim((string)($data['sort_order'] ?? ''));
+
+    if ($heading === '') {
+        echo json_encode(['success' => false, 'message' => 'Heading is required']);
+        exit();
+    }
+    if (!in_array($bill_type, ['forwarding', 'detention'], true)) {
+        echo json_encode(['success' => false, 'message' => 'Invalid bill type']);
+        exit();
+    }
+    if (!in_array($receipt_status, ['Receipted', 'Unreceipted'], true)) {
+        echo json_encode(['success' => false, 'message' => 'Invalid receipt status']);
+        exit();
+    }
+    if ($sort_order === '') {
+        $stmt = $pdo->prepare("SELECT COALESCE(MAX(sort_order), 0) + 1 FROM custom_bill_headings WHERE bill_type = ?");
+        $stmt->execute([$bill_type]);
+        $sort_order = (int)$stmt->fetchColumn();
+    } else {
+        $sort_order = (int)$sort_order;
+    }
+
+    $stmt = $pdo->prepare("SELECT id FROM custom_bill_headings WHERE bill_type = ? AND heading = ? AND id != ?");
+    $stmt->execute([$bill_type, $heading, $id]);
+    if ($stmt->fetchColumn()) {
+        echo json_encode(['success' => false, 'message' => '"' . $heading . '" already exists for this bill type']);
+        exit();
+    }
+
+    if ($id) {
+        $stmt = $pdo->prepare("UPDATE custom_bill_headings SET heading = ?, bill_type = ?, receipt_status = ?, sort_order = ?, is_active = ? WHERE id = ?");
+        $stmt->execute([$heading, $bill_type, $receipt_status, $sort_order, $is_active, $id]);
+    } else {
+        $stmt = $pdo->prepare("INSERT INTO custom_bill_headings (heading, bill_type, receipt_status, sort_order, is_active) VALUES (?, ?, ?, ?, ?)");
+        $stmt->execute([$heading, $bill_type, $receipt_status, $sort_order, $is_active]);
+    }
+    echo json_encode(['success' => true]);
+    exit();
+}
+
+if ($page == 'delete-bill-heading' && $_SERVER['REQUEST_METHOD'] == 'POST' && isAdmin()) {
+    header('Content-Type: application/json');
+    $data = json_decode(file_get_contents('php://input'), true) ?: [];
+    $stmt = $pdo->prepare("DELETE FROM custom_bill_headings WHERE id = ?");
+    $stmt->execute([(int)($data['id'] ?? 0)]);
+    echo json_encode(['success' => $stmt->rowCount() > 0, 'message' => $stmt->rowCount() > 0 ? 'Heading deleted' : 'Heading not found']);
+    exit();
 }
 
 if ($page == 'add-master' && $_SERVER['REQUEST_METHOD'] == 'POST' && isAdmin()) {
@@ -9675,24 +9812,14 @@ window.onclick = function(e) { if(e.target.classList && e.target.classList.conta
                             </select>
                         </div>
                         
-                        <!-- ============ MANAGE CUSTOM ITEMS BUTTON ============ -->
+                        <?php if (isAdmin()): ?>
                         <div style="margin-top:10px;">
-                            <button type="button" class="btn-manage-custom" onclick="toggleCustomItemsManager()">
-                                <i class="fas fa-cog"></i> Manage Custom Headings
-                            </button>
+                            <a href="system.php?page=masters&type=bill_heading" class="btn-manage-custom" style="text-decoration:none; display:inline-block; margin-left:0;">
+                                <i class="fas fa-cog"></i> Manage Bill Headings
+                            </a>
                         </div>
-                        
-                        <!-- ============ CUSTOM ITEMS MANAGER ============ -->
-                        <div class="custom-items-manager" id="customItemsManager">
-                            <h4 style="margin-bottom:10px; color:#1e293b; font-size:14px;">
-                                📝 Your Custom Headings 
-                                <span style="font-size:11px; color:#64748b;">(Click ✕ to remove permanently)</span>
-                            </h4>
-                            <div id="customItemsList">
-                                <p style="color:#94a3b8; font-size:12px;">No custom headings yet.</p>
-                            </div>
-                        </div>
-                        
+                        <?php endif; ?>
+
                         <!-- ============ ADD NEW ITEM ROW ============ -->
                         <div style="margin-top:20px;">
                             <label style="font-weight:700; color:#1e293b; text-transform:uppercase; font-size:12px; letter-spacing:0.5px; display:block; margin-bottom:10px;">
@@ -9703,7 +9830,7 @@ window.onclick = function(e) { if(e.target.classList && e.target.classList.conta
                                     <option value="">-- Select Item Heading --</option>
                                     <option value="__new__">➕ Add New Item...</option>
                                 </select>
-                                <input type="text" id="customHeadingInput" placeholder="Type custom heading..." style="flex:3; display:none;">
+                                <input type="text" id="customHeadingInput" placeholder="Type heading for this bill only..." style="flex:3; display:none;">
                                 <select id="receiptStatus" style="flex:1.5;">
                                     <option value="Receipted">✅ Receipted</option>
                                     <option value="Unreceipted">⏳ Unreceipted</option>
@@ -9738,7 +9865,7 @@ window.onclick = function(e) { if(e.target.classList && e.target.classList.conta
                                             <td colspan="6">
                                                 <i class="fas fa-inbox"></i>
                                                 <p>No items added yet</p>
-                                                <p style="font-size:11px; color:#94a3b8;">Add items from above or previous items will auto-load</p>
+                                                <p style="font-size:11px; color:#94a3b8;">Headings for the selected bill type load from Masters &gt; Bill Headings</p>
                                             </td>
                                         </tr>
                                     </tbody>
@@ -9860,143 +9987,38 @@ document.getElementById('billForm').addEventListener('submit', function(e) {
     console.log('Submitting label: ' + document.getElementById('advanceLabelHidden').value);
 });
 
-// ============ AAPKE ORIGINAL DEFAULT ITEMS ============
-var allForwardingItems = [
-    'Transportation Expense',
-    'Wharfage Expense',
-    'Excise Duty Expense',
-    'Delivery Order Expense',
-    'Lift Off / Lift On Expense',
-    'TP-Delivery Expense',
-    'Service Charges',
-    'Misc. Expense',
-    'Unloading Dry Port Expense',
-    'Token',
-    'Via Port',
-    'Trakker Payment',
-    'Container Placement Expense',
-    'Gate Pass Charges',
-    'Scanning Expense',
-    'Shipping Guarantee Charges'
-];
-
-var allDetentionItems = [
-    'Container Rent Expense',
-    'Container Placement Expense',
-    'Empty Back Date Expense',
-    'Container Washing / Cleaning Expense'
-];
-
+// ============ BILL HEADINGS (from Masters > Bill Headings) ============
+// { forwarding: [{heading, receipt_status}, ...], detention: [...] } — active only, in sort order
+var billHeadings = <?php echo json_encode($billHeadingDefs, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT); ?>;
 var allHeadings = [];
+var currentBillType = null;
 
-// ============ LOCAL STORAGE SE CUSTOM ITEMS LOAD/SAVE/REMOVE KARO ============
-function getCustomItems(billType) {
-    var key = 'custom_items_' + billType;
-    var stored = localStorage.getItem(key);
-    if (stored) {
-        try {
-            return JSON.parse(stored);
-        } catch(e) {
-            return [];
-        }
+function getHeadingDef(heading) {
+    var defs = billHeadings[currentBillType] || [];
+    for (var i = 0; i < defs.length; i++) {
+        if (defs[i].heading === heading) return defs[i];
     }
-    return [];
-}
-
-function saveCustomItem(billType, heading) {
-    var customItems = getCustomItems(billType);
-    if (!customItems.includes(heading)) {
-        customItems.push(heading);
-        localStorage.setItem('custom_items_' + billType, JSON.stringify(customItems));
-        console.log('Custom item saved:', heading);
-        renderCustomItemsManager();
-    }
-}
-
-function removeCustomItem(billType, heading) {
-    if (confirm('Are you sure you want to permanently remove "' + heading + '" from custom headings?')) {
-        var customItems = getCustomItems(billType);
-        var index = customItems.indexOf(heading);
-        if (index > -1) {
-            customItems.splice(index, 1);
-            localStorage.setItem('custom_items_' + billType, JSON.stringify(customItems));
-            console.log('Custom item removed:', heading);
-            
-            // Update allHeadings
-            if(billType === 'forwarding') {
-                allHeadings = [...allForwardingItems, ...customItems];
-            } else {
-                allHeadings = [...allDetentionItems, ...customItems];
-            }
-            
-            // Update dropdown and table
-            updateItemDropdown();
-            renderTable();
-            renderCustomItemsManager();
-        }
-    }
-}
-
-// ============ CUSTOM ITEMS MANAGER UI ============
-function toggleCustomItemsManager() {
-    var manager = document.getElementById('customItemsManager');
-    manager.classList.toggle('show');
-    if (manager.classList.contains('show')) {
-        renderCustomItemsManager();
-    }
-}
-
-function renderCustomItemsManager() {
-    var billType = document.getElementById('bill_type').value;
-    var customItems = getCustomItems(billType);
-    var container = document.getElementById('customItemsList');
-    
-    if (customItems.length === 0) {
-        container.innerHTML = '<p style="color:#94a3b8; font-size:12px;">No custom headings yet. Add one using "➕ Add New Item..." above.</p>';
-        return;
-    }
-    
-    var html = '';
-    customItems.forEach(function(item) {
-        html += '<span class="custom-item-tag">' +
-                escapeHtml(item) + 
-                ' <span class="remove-custom" onclick="removeCustomItem(\'' + billType + '\', \'' + escapeHtml(item).replace(/'/g, "\\'") + '\')" title="Remove permanently">✕</span>' +
-                '</span>';
-    });
-    
-    container.innerHTML = html;
+    return null;
 }
 
 // ============ INIT FUNCTION ============
 function changeBillType() {
-    var type = document.getElementById('bill_type').value;
-    var customItems = getCustomItems(type);
-    
-    if(type === 'forwarding') {
-        allHeadings = [...allForwardingItems, ...customItems];
-    } else {
-        allHeadings = [...allDetentionItems, ...customItems];
+    var select = document.getElementById('bill_type');
+    var type = select.value;
+    var hasAmounts = billItems.some(item => String(item.amount || '').trim() !== '');
+    if (currentBillType !== null && hasAmounts && !confirm('Changing the bill type will replace the current items and their amounts. Continue?')) {
+        select.value = currentBillType;
+        return;
     }
-    
-    // Always load all items (defaults + custom from localStorage)
-    loadDefaultItems(allHeadings);
-    
-    // Update custom items manager if visible
-    if (document.getElementById('customItemsManager').classList.contains('show')) {
-        renderCustomItemsManager();
-    }
-}
+    currentBillType = type;
 
-function loadDefaultItems(items) {
-    billItems = [];
-    console.log(items)
-    items.forEach(heading => {
-        billItems.push({
-            heading: heading,
-            status: 'Receipted',
-            amount: ''
-        });
-    });
+    var defs = billHeadings[type] || [];
+    allHeadings = defs.map(d => d.heading);
+    billItems = defs.map(d => ({
+        heading: d.heading,
+        status: d.receipt_status,
+        amount: ''
+    }));
     updateItemDropdown();
     renderTable();
 }
@@ -10005,7 +10027,7 @@ function updateItemDropdown() {
     var sel = document.getElementById('itemSelect');
     var used = billItems.map(i => i.heading);
     var avail = allHeadings.filter(h => !used.includes(h));
-    
+
     sel.innerHTML = '<option value="">-- Select Item Heading --</option>' +
                     '<option value="__new__">➕ Add New Item...</option>';
     avail.forEach(h => {
@@ -10023,6 +10045,8 @@ function handleItemSelectChange() {
     } else {
         customInput.style.display = 'none';
         sel.style.display = '';
+        var def = getHeadingDef(sel.value);
+        if (def) document.getElementById('receiptStatus').value = def.receipt_status;
     }
 }
 
@@ -10031,27 +10055,14 @@ function addItem() {
     var sel = document.getElementById('itemSelect');
     var customInput = document.getElementById('customHeadingInput');
     var heading;
-    
+
     if(sel.style.display === 'none' || sel.value === '__new__') {
+        // One-off heading for this bill only; permanent headings are added in Masters > Bill Headings
         heading = customInput.value.trim();
         if(!heading) {
             alert('Please enter a custom heading!');
             return;
         }
-        var billType = document.getElementById('bill_type').value;
-        
-        // Save custom item to localStorage
-        saveCustomItem(billType, heading);
-        
-        // Update allHeadings immediately
-        var customItems = getCustomItems(billType);
-        if(billType === 'forwarding') {
-            allHeadings = [...allForwardingItems, ...customItems];
-        } else {
-            allHeadings = [...allDetentionItems, ...customItems];
-        }
-        
-        // Reset custom input
         customInput.style.display = 'none';
         sel.style.display = '';
         sel.value = '';
@@ -10063,18 +10074,18 @@ function addItem() {
             return;
         }
     }
-    
+
     var status = document.getElementById('receiptStatus').value;
     var amount = document.getElementById('itemAmount').value;
-    
+
     billItems.push({
         heading: heading,
         status: status,
         amount: amount
     });
-    
+
     document.getElementById('itemAmount').value = '';
-    
+
     updateItemDropdown();
     renderTable();
 }
@@ -10104,8 +10115,7 @@ function renderTable() {
             '<td class="drag-handle-cell">⋮⋮</td>' +
             '<td style="text-align:center;"><span class="row-number">' + (i+1) + '</span></td>' +
             '<td class="item-select-cell">' +
-                '<input type="hidden" name="heading[]" value="' + escapeHtml(item.heading) + '">' +
-                '<select name="item_heading_select[]" onchange="updateHeading(' + i + ', this.value)" style="width:100%;">' +
+                '<select name="heading[]" onchange="updateHeading(' + i + ', this.value)" style="width:100%;">' +
                     getAllOptions(item.heading) +
                 '</select>' +
             '</td>' +
@@ -10116,9 +10126,9 @@ function renderTable() {
                 '</select>' +
             '</td>' +
             '<td class="item-input-cell">' +
-                '<input type="text" name="amount[]" value="' + (item.amount || '') + '" ' +
+                '<input type="text" name="amount[]" value="' + escapeHtml(item.amount) + '" ' +
                 'onchange="updateAmount(' + i + ', this.value)" ' +
-                'onkeyup="updateAmount(' + i + ', this.value); calcTotal();" placeholder="0.00 or text" style="text-align:right;">' +
+                'oninput="updateAmount(' + i + ', this.value); calcTotal();" placeholder="0.00 or text" style="text-align:right;">' +
             '</td>' +
             '<td>' +
                 '<button type="button" class="btn-delete-row" onclick="deleteItem(' + i + ')" title="Remove">' +
@@ -10132,7 +10142,9 @@ function renderTable() {
 }
 
 function getAllOptions(selectedHeading) {
-    return allHeadings.map(h => 
+    // Keep one-off headings (not in the master list) selectable on their own row
+    var options = allHeadings.includes(selectedHeading) ? allHeadings : [selectedHeading].concat(allHeadings);
+    return options.map(h =>
         '<option value="' + escapeHtml(h) + '"' + (h === selectedHeading ? ' selected' : '') + '>' + escapeHtml(h) + '</option>'
     ).join('');
 }
@@ -10234,9 +10246,7 @@ function numToWords(n) {
 
 function escapeHtml(t) {
     if(!t) return '';
-    var d = document.createElement('div');
-    d.appendChild(document.createTextNode(t));
-    return d.innerHTML;
+    return String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#039;');
 }
 
 // ============ PAGE LOAD HOTE HI INITIALIZE KARO ============
@@ -12924,13 +12934,13 @@ window.onclick = function(e) { if(e.target.classList && e.target.classList.conta
                     <p class="page-subtitle">Manage dropdown options (Admin Only)</p>
                 </div>
                 <div style="display: flex; gap: 10px;">
-                    
-                    <button class="btn-primary" onclick="openMasterModal()"><i class="fas fa-plus"></i> Add New</button>
+
+                    <button class="btn-primary" onclick="<?php echo ($type == 'bill_heading') ? 'openBillHeadingModal()' : 'openMasterModal()'; ?>"><i class="fas fa-plus"></i> Add New</button>
                 </div>
             </div>
-            
+
             <div class="master-types" style="display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 20px;">
-                <?php 
+                <?php
                 $types = [
                     'bonded_carrier'        => 'Bonded Carrier',
                     'do_collected_date'     => 'D/O',
@@ -12944,11 +12954,12 @@ window.onclick = function(e) { if(e.target.classList && e.target.classList.conta
                     'depositor'             => 'Depositor',
                     'description'           => 'Description'
                 ];
-                
+
                 $filteredTypes = array_filter($types, function($key) {
                     return $key !== 'khi_port';
                 }, ARRAY_FILTER_USE_KEY);
-                
+                $filteredTypes['bill_heading'] = 'Bill Headings';
+
                 foreach($filteredTypes as $key=>$label): 
                 ?>
                     <a href="system.php?page=masters&type=<?php echo $key; ?>" class="master-type-btn <?php echo ($type==$key)?'active':''; ?>" style="background: <?php echo ($type==$key)?'#8e181e':'#f8fafd'; ?>; border: 1px solid #c8e6c9; padding: 8px 16px; border-radius: 20px; cursor: pointer; text-decoration: none; color: <?php echo ($type==$key)?'white':'#18224b'; ?>; font-size: 0.85rem; transition: all 0.3s;">
@@ -12957,6 +12968,58 @@ window.onclick = function(e) { if(e.target.classList && e.target.classList.conta
                 <?php endforeach; ?>
             </div>
             
+            <?php if ($type == 'bill_heading'): $totalCount = 0; ?>
+            <div class="card">
+                <div class="card-body" style="padding:0;">
+                    <div class="google-sheets-container" style="overflow-x: auto; border-radius: 8px; border: 1px solid #e0e0e0; background: white; max-height: calc(100vh - 300px); overflow-y: auto;">
+                        <table class="masters-google-table" id="mastersTable" style="width:100%; border-collapse: collapse; font-family: 'Segoe UI', 'Roboto', 'Arial', sans-serif; font-size: 13px; background: white;">
+                            <thead>
+                                <tr class="titles-row" style="background-color: #18224b;">
+                                    <th class="sortable" data-column="0" style="background-color: #18224b; color: white; padding: 12px 8px; font-weight: 600; font-size: 13px; white-space: nowrap; border-right: 1px solid rgba(255,255,255,0.2); position: sticky; top: 0; z-index: 10; width:80px;">SORT</th>
+                                    <th class="sortable" data-column="1" style="background-color: #18224b; color: white; padding: 12px 8px; font-weight: 600; font-size: 13px; white-space: nowrap; border-right: 1px solid rgba(255,255,255,0.2); position: sticky; top: 0; z-index: 10;">HEADING</th>
+                                    <th class="sortable" data-column="2" style="background-color: #18224b; color: white; padding: 12px 8px; font-weight: 600; font-size: 13px; white-space: nowrap; border-right: 1px solid rgba(255,255,255,0.2); position: sticky; top: 0; z-index: 10;">BILL TYPE</th>
+                                    <th class="sortable" data-column="3" style="background-color: #18224b; color: white; padding: 12px 8px; font-weight: 600; font-size: 13px; white-space: nowrap; border-right: 1px solid rgba(255,255,255,0.2); position: sticky; top: 0; z-index: 10;">RECEIPT STATUS</th>
+                                    <th class="sortable" data-column="4" style="background-color: #18224b; color: white; padding: 12px 8px; font-weight: 600; font-size: 13px; white-space: nowrap; border-right: 1px solid rgba(255,255,255,0.2); position: sticky; top: 0; z-index: 10;">STATUS</th>
+                                    <th style="background-color: #18224b; color: white; padding: 12px 8px; font-weight: 600; font-size: 13px; white-space: nowrap; position: sticky; top: 0; z-index: 10;">ACTIONS</th>
+                                </tr>
+                                <tr class="filter-row" style="background-color: #f8f9fa;">
+                                    <th style="padding: 6px 8px; border-bottom: 1px solid #e0e0e0;"><input type="text" class="col-filter" data-col="0" placeholder="Sort" style="width:100%; padding: 6px 8px; font-size: 11px; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box;"></th>
+                                    <th style="padding: 6px 8px;"><input type="text" class="col-filter" data-col="1" placeholder="Filter Heading" style="width:100%; padding: 6px 8px; font-size: 11px; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box;"></th>
+                                    <th style="padding: 6px 8px;"><input type="text" class="col-filter" data-col="2" placeholder="Filter Bill Type" style="width:100%; padding: 6px 8px; font-size: 11px; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box;"></th>
+                                    <th style="padding: 6px 8px;"><input type="text" class="col-filter" data-col="3" placeholder="Filter Receipt Status" style="width:100%; padding: 6px 8px; font-size: 11px; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box;"></th>
+                                    <th style="padding: 6px 8px;"><input type="text" class="col-filter" data-col="4" placeholder="Filter Status" style="width:100%; padding: 6px 8px; font-size: 11px; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box;"></th>
+                                    <th style="padding: 6px 8px;"></th>
+                                </tr>
+                            </thead>
+                            <tbody id="mastersTbody">
+                                <?php if (empty($billHeadingRows)): ?>
+                                <tr>
+                                    <td colspan="6" style="text-align:center; padding:60px;">
+                                        <i class="fas fa-folder-open" style="font-size:48px; color:#c8e6c9;"></i>
+                                        <p style="margin-top:10px; color:#666;">No bill headings yet. Click "Add New" to get started.</p>
+                                    </td>
+                                </tr>
+                                <?php else: foreach ($billHeadingRows as $bh): ?>
+                                <tr data-id="<?php echo (int)$bh['id']; ?>" data-heading="<?php echo htmlspecialchars($bh['heading']); ?>" data-billtype="<?php echo htmlspecialchars($bh['bill_type']); ?>" data-receipt="<?php echo htmlspecialchars($bh['receipt_status']); ?>" data-sort="<?php echo (int)$bh['sort_order']; ?>" data-status="<?php echo (int)$bh['is_active']; ?>">
+                                    <td style="padding: 10px 8px; border-bottom: 1px solid #e8eaed; border-right: 1px solid #e8eaed; text-align:center;"><?php echo (int)$bh['sort_order']; ?></td>
+                                    <td style="padding: 10px 8px; border-bottom: 1px solid #e8eaed; border-right: 1px solid #e8eaed;"><strong><?php echo htmlspecialchars($bh['heading']); ?></strong></td>
+                                    <td style="padding: 10px 8px; border-bottom: 1px solid #e8eaed; border-right: 1px solid #e8eaed;"><?php echo $bh['bill_type'] == 'detention' ? 'Detention / Placement' : 'Forwarding'; ?></td>
+                                    <td style="padding: 10px 8px; border-bottom: 1px solid #e8eaed; border-right: 1px solid #e8eaed;"><?php echo htmlspecialchars($bh['receipt_status']); ?></td>
+                                    <td style="padding: 10px 8px; border-bottom: 1px solid #e8eaed; border-right: 1px solid #e8eaed;">
+                                        <span class="status-badge <?php echo $bh['is_active'] ? 'active' : 'cancelled'; ?>"><?php echo $bh['is_active'] ? 'Active' : 'Inactive'; ?></span>
+                                    </td>
+                                    <td class="action-cell" style="padding: 10px 8px; border-bottom: 1px solid #e8eaed; white-space: nowrap; text-align: center;">
+                                        <button class="btn-warning btn-sm bh-edit-btn" title="Edit" style="padding: 4px 8px; font-size: 11px; margin: 0 2px; border-radius: 4px; border: none; cursor: pointer; background:#ff9800; color:white;"><i class="fas fa-edit"></i></button>
+                                        <button class="btn-danger btn-sm bh-delete-btn" title="Delete" style="padding: 4px 8px; font-size: 11px; margin: 0 2px; border-radius: 4px; border: none; cursor: pointer; background:#dc3545; color:white;"><i class="fas fa-trash"></i></button>
+                                    </td>
+                                </tr>
+                                <?php endforeach; endif; ?>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+            <?php else: ?>
             <div class="card">
                 <div class="card-body" style="padding:0;">
                     <div class="google-sheets-container" style="overflow-x: auto; border-radius: 8px; border: 1px solid #e0e0e0; background: white; max-height: calc(100vh - 300px); overflow-y: auto;">
@@ -13055,6 +13118,53 @@ window.onclick = function(e) { if(e.target.classList && e.target.classList.conta
                     </div>
                 </div>
             </div>
+            <?php endif; ?>
+        </div>
+    </div>
+</div>
+
+<!-- Add/Edit Bill Heading Modal -->
+<div id="billHeadingModal" class="modal">
+    <div class="modal-content" style="max-width:500px;">
+        <div class="modal-header">
+            <h3 id="billHeadingModalTitle">Add Bill Heading</h3>
+            <button class="close-modal" onclick="closeBillHeadingModal()">&times;</button>
+        </div>
+        <div class="modal-body">
+            <input type="hidden" id="bhId">
+            <div class="form-group">
+                <label>Heading</label>
+                <input type="text" id="bhHeading" class="form-control" maxlength="255" required>
+            </div>
+            <div class="form-group">
+                <label>Bill Type</label>
+                <select id="bhBillType" class="form-control">
+                    <option value="forwarding">Forwarding</option>
+                    <option value="detention">Detention / Placement</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label>Default Receipt Status</label>
+                <select id="bhReceiptStatus" class="form-control">
+                    <option value="Receipted">Receipted</option>
+                    <option value="Unreceipted">Unreceipted</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label>Sort Order</label>
+                <input type="number" id="bhSortOrder" class="form-control" placeholder="Leave empty to add at the end">
+            </div>
+            <div class="form-group">
+                <label>Status</label>
+                <select id="bhStatus" class="form-control">
+                    <option value="1">Active</option>
+                    <option value="0">Inactive</option>
+                </select>
+            </div>
+        </div>
+        <div class="modal-footer">
+            <button class="btn-danger" onclick="closeBillHeadingModal()">Cancel</button>
+            <button class="btn-primary" onclick="saveBillHeading()">Save</button>
         </div>
     </div>
 </div>
@@ -13690,6 +13800,71 @@ function initMastersSorting() {
         });
     });
 }
+
+// ============ BILL HEADINGS MASTER ============
+function openBillHeadingModal(row) {
+    document.getElementById('billHeadingModalTitle').innerText = row ? 'Edit Bill Heading' : 'Add Bill Heading';
+    document.getElementById('bhId').value = row ? row.getAttribute('data-id') : '';
+    document.getElementById('bhHeading').value = row ? row.getAttribute('data-heading') : '';
+    document.getElementById('bhBillType').value = row ? row.getAttribute('data-billtype') : 'forwarding';
+    document.getElementById('bhReceiptStatus').value = row ? row.getAttribute('data-receipt') : 'Receipted';
+    document.getElementById('bhSortOrder').value = row ? row.getAttribute('data-sort') : '';
+    document.getElementById('bhStatus').value = row ? row.getAttribute('data-status') : '1';
+    document.getElementById('billHeadingModal').style.display = 'flex';
+    document.getElementById('bhHeading').focus();
+}
+
+function closeBillHeadingModal() {
+    document.getElementById('billHeadingModal').style.display = 'none';
+}
+
+function saveBillHeading() {
+    var heading = document.getElementById('bhHeading').value.trim();
+    if (!heading) {
+        alert('Please enter a heading');
+        return;
+    }
+    fetch('system.php?page=save-bill-heading', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            id: document.getElementById('bhId').value,
+            heading: heading,
+            bill_type: document.getElementById('bhBillType').value,
+            receipt_status: document.getElementById('bhReceiptStatus').value,
+            sort_order: document.getElementById('bhSortOrder').value,
+            is_active: document.getElementById('bhStatus').value === '1'
+        })
+    })
+    .then(r => r.json())
+    .then(data => {
+        if (data.success) location.reload();
+        else alert(data.message || 'Error saving heading');
+    })
+    .catch(() => alert('Network error occurred'));
+}
+
+function deleteBillHeading(row) {
+    if (!confirm('Delete "' + row.getAttribute('data-heading') + '"?\n\nExisting bills keep their items. To hide it from new bills only, edit it and set Status to Inactive.')) return;
+    fetch('system.php?page=delete-bill-heading', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: row.getAttribute('data-id') })
+    })
+    .then(r => r.json())
+    .then(data => {
+        if (data.success) location.reload();
+        else alert(data.message || 'Error deleting heading');
+    })
+    .catch(() => alert('Network error occurred'));
+}
+
+document.addEventListener('click', function(e) {
+    var editBtn = e.target.closest('.bh-edit-btn');
+    if (editBtn) openBillHeadingModal(editBtn.closest('tr'));
+    var deleteBtn = e.target.closest('.bh-delete-btn');
+    if (deleteBtn) deleteBillHeading(deleteBtn.closest('tr'));
+});
 
 // Event delegation for edit and delete buttons
 document.addEventListener('click', function(e) {
