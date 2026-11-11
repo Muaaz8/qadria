@@ -983,6 +983,33 @@ function getBillHeadingRows($pdo, $bill_type = null, $activeOnly = true) {
     return $stmt->fetchAll(PDO::FETCH_ASSOC);
 }
 
+// Save the row order used on a bill as the headings' sort order.
+// Only the headings on the bill are reordered among themselves; every other heading keeps its position.
+function updateBillHeadingOrder($pdo, $bill_type, $postedHeadings) {
+    $rows = getBillHeadingRows($pdo, $bill_type, false);
+    $idByHeading = [];
+    foreach ($rows as $row) {
+        $idByHeading[$row['heading']] = $row['id'];
+    }
+    $billOrder = [];
+    foreach ($postedHeadings as $heading) {
+        $heading = trim($heading);
+        if (isset($idByHeading[$heading]) && !in_array($heading, $billOrder, true)) {
+            $billOrder[] = $heading;
+        }
+    }
+    if (count($billOrder) < 2) return;
+
+    $next = 0;
+    $stmt = $pdo->prepare("UPDATE custom_bill_headings SET sort_order = ? WHERE id = ?");
+    foreach ($rows as $i => $row) {
+        $heading = in_array($row['heading'], $billOrder, true) ? $billOrder[$next++] : $row['heading'];
+        if ($heading !== $row['heading'] || (int)$row['sort_order'] !== $i + 1) {
+            $stmt->execute([$i + 1, $idByHeading[$heading]]);
+        }
+    }
+}
+
 // One-time import of the old hardcoded headings into custom_bill_headings.
 // Headings the create-bill page used to load by default stay active; the rest are imported inactive.
 function seedBillHeadings($pdo) {
@@ -4502,7 +4529,9 @@ if ($page == 'save-bill' && $_SERVER['REQUEST_METHOD'] == 'POST') {
                 }
             }
         }
-        
+
+        updateBillHeadingOrder($pdo, $bill_type, $headings);
+
         $stmt = $pdo->prepare("SELECT * FROM bills WHERE id = ?"); 
         $stmt->execute([$bill_id]); 
         $bill_data = $stmt->fetch();
